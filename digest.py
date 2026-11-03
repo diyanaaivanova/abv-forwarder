@@ -1,6 +1,6 @@
 """Веднъж на ден праща списък с писмата от последните 24 часа.
 
-Чете abv (винаги) и пощата в Gmail (ако има GMAIL_USER и
+Чете abv по POP3 (винаги) и пощата в Gmail по IMAP (ако има GMAIL_USER и
 GMAIL_APP_PASSWORD). Не маркира нищо като прочетено. Изпраща едно писмо
 с подател, тема и първите редове на всяко писмо.
 """
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import envfile  # noqa: E402
 envfile.load()
+import abvpop  # noqa: E402
 
 TZ = ZoneInfo("Europe/Sofia")
 ABV_USER = os.environ["ABV_USER"]
@@ -31,7 +32,6 @@ GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 HOURS = int(os.environ.get("DIGEST_HOURS", "24"))
 SNIPPET = 220
 USE_SSL = os.environ.get("USE_SSL", "1") == "1"  # 0 само за локален тест
-IMAP_ABV = os.environ.get("IMAP_HOST", "imap.abv.bg")
 IMAP_GMAIL = os.environ.get("GMAIL_IMAP_HOST", "imap.gmail.com")
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.abv.bg")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
@@ -62,7 +62,54 @@ def attachments(msg):
     return [p.get_filename() for p in msg.iter_attachments() if p.get_filename()]
 
 
-def collect(host, user, password, label, since):
+def item(raw, label, received):
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    if msg.get("X-Forwarded-By") == "abv-forwarder":
+        return None  # вече е в списъка от abv
+    name, addr = email.utils.parseaddr(str(msg.get("From", "")))
+    return {
+        "box": label,
+        "time": received.astimezone(TZ) if received else None,
+        "from": name or addr or "?",
+        "addr": addr.lower(),
+        "subject": str(msg.get("Subject", "")) or "(без тема)",
+        "text": text_of(msg),
+        "files": attachments(msg),
+    }
+
+
+def msg_date(raw):
+    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    try:
+        d = email.utils.parsedate_to_datetime(msg.get("Date"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def collect_abv(since):
+    """abv е само POP3: вървим от най-новите писма назад, докато станат по-стари."""
+    pop = abvpop.connect(ABV_USER, ABV_PASSWORD)
+    items, older = [], 0
+    try:
+        nums = [n for n, _ in abvpop.listing(pop)]
+        for n in reversed(nums):
+            when = msg_date(abvpop.headers(pop, n))
+            if when and when < since:
+                older += 1
+                if older >= 10:  # 10 поредни стари писма — спираме
+                    break
+                continue
+            older = 0
+            it = item(abvpop.retr(pop, n), "abv", when)
+            if it:
+                items.append(it)
+    finally:
+        pop.quit()
+    return items
+
+
+def collect_imap(host, user, password, label, since):
     imap = (imaplib.IMAP4_SSL(host, IMAP_PORT, ssl_context=ssl.create_default_context())
             if USE_SSL else imaplib.IMAP4(host, IMAP_PORT))
     imap.login(user, password)
@@ -78,21 +125,11 @@ def collect(host, user, password, label, since):
             continue
         when = imaplib.Internaldate2tuple(raw[0])  # местно време на машината
         received = datetime.fromtimestamp(time.mktime(when), tz=timezone.utc) if when else None
-        msg = email.message_from_bytes(raw[1], policy=email.policy.default)
         if received and received < since:
             continue
-        if msg.get("X-Forwarded-By") == "abv-forwarder":
-            continue  # вече е в списъка от abv
-        name, addr = email.utils.parseaddr(str(msg.get("From", "")))
-        items.append({
-            "box": label,
-            "time": received.astimezone(TZ) if received else None,
-            "from": name or addr or "?",
-            "addr": addr.lower(),
-            "subject": str(msg.get("Subject", "")) or "(без тема)",
-            "text": text_of(msg),
-            "files": attachments(msg),
-        })
+        it = item(raw[1], label, received)
+        if it:
+            items.append(it)
     imap.logout()
     return items
 
@@ -139,9 +176,9 @@ def render(items, since):
 
 def main():
     since = datetime.now(timezone.utc) - timedelta(hours=HOURS)
-    items = collect(IMAP_ABV, ABV_USER, ABV_PASSWORD, "abv", since)
+    items = collect_abv(since)
     if GMAIL_USER and GMAIL_PASSWORD:
-        items += collect(IMAP_GMAIL, GMAIL_USER, GMAIL_PASSWORD, "office", since)
+        items += collect_imap(IMAP_GMAIL, GMAIL_USER, GMAIL_PASSWORD, "office", since)
 
     html_body, plain = render(items, since)
     msg = EmailMessage()

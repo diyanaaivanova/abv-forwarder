@@ -1,8 +1,8 @@
 """Препраща новите писма от пощата в abv.bg към друг адрес.
 
-Пуска се по график (GitHub Actions). Чете INBOX по IMAP без да маркира писмата
-като прочетени, препраща всяко ново писмо през SMTP на abv и записва номера
-(UID) на последното обработено писмо в state.json.
+Пуска се по график (GitHub Actions). Чете пощата по POP3 (без да трие писмата),
+препраща всяко ново писмо през SMTP на abv и пази в state.json кои писма
+вече е видял (като кратки хешове, не реалните идентификатори).
 
 При първото пускане само запомня докъде е стигнала пощата: старите писма
 НЕ се препращат.
@@ -10,21 +10,18 @@
 import email
 import email.policy
 import email.utils
-import imaplib
 import json
 import os
 import smtplib
 import ssl
-import sys
 from email.header import Header, decode_header, make_header
 from pathlib import Path
 
 
 import envfile  # noqa: E402
 envfile.load()
+import abvpop  # noqa: E402
 
-IMAP_HOST = os.environ.get("IMAP_HOST", "imap.abv.bg")
-IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.abv.bg")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 USER = os.environ["ABV_USER"]
@@ -99,61 +96,49 @@ def main():
     state = load_state()
     ctx = ssl.create_default_context()
 
-    imap = (imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
-            if USE_SSL else imaplib.IMAP4(IMAP_HOST, IMAP_PORT))
-    imap.login(USER, PASSWORD)
-    typ, _ = imap.select("INBOX", readonly=True)  # readonly: не маркира като прочетени
-    if typ != "OK":
-        sys.exit("Не мога да отворя INBOX")
-
-    validity = imap.response("UIDVALIDITY")[1][0].decode()
-    typ, data = imap.uid("SEARCH", None, "ALL")
-    uids = [int(u) for u in data[0].split()] if data and data[0] else []
-    top = max(uids) if uids else 0
-
-    if state.get("uidvalidity") != validity or "last_uid" not in state:
-        # Първо пускане (или пощата е преномерирана): само запомняме докъде сме.
-        log(f"Начална точка: UID {top}. Старите писма не се препращат.")
-        save_state({"uidvalidity": validity, "last_uid": top})
-        imap.logout()
-        return
-
-    last = int(state["last_uid"])
-    new = sorted(u for u in uids if u > last)[:MAX_PER_RUN]
-    if not new:
-        log("Няма нови писма.")
-        imap.logout()
-        return
-
-    own = USER.lower()
-    fwd = FORWARD_TO.lower()
-    smtp = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx)
-            if USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT))
-    smtp.login(USER, PASSWORD)
-    sent = 0
+    pop = abvpop.connect(USER, PASSWORD)
     try:
-        for uid in new:
-            typ, msg_data = imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
-            raw = next((p[1] for p in msg_data if isinstance(p, tuple)), None)
-            if typ != "OK" or raw is None:
-                log(f"UID {uid}: не може да се прочете, пропускам.")
-                last = uid
-                continue
-            msg, sender = build_forward(raw)
-            if sender.lower() in (own, fwd):
-                # Не препращаме писма от самите нас (иначе може да стане кръг).
-                log(f"UID {uid}: от нас самите, пропускам.")
-            else:
-                smtp.sendmail(USER, [FORWARD_TO], msg.as_bytes())
-                sent += 1
-                log(f"UID {uid}: препратено.")
-            last = uid
-            save_state({"uidvalidity": validity, "last_uid": last})
+        msgs = abvpop.listing(pop)
+        keys_now = {k for _, k in msgs}
+        seen = set(state.get("seen", []))
+
+        if not state.get("init"):
+            # Първо пускане: само запомняме какво има. Старите писма не се препращат.
+            save_state({"init": True, "seen": sorted(keys_now)})
+            log(f"Начална точка: {len(msgs)} писма в пощата. Старите не се препращат.")
+            return
+
+        new = [(n, k) for n, k in msgs if k not in seen][:MAX_PER_RUN]
+        if not new:
+            log("Няма нови писма.")
+            # пазим само ключове, които още ги има на сървъра
+            if seen - keys_now:
+                save_state({"init": True, "seen": sorted(seen & keys_now)})
+            return
+
+        own = USER.lower()
+        fwd = FORWARD_TO.lower()
+        smtp = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx)
+                if USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT))
+        smtp.login(USER, PASSWORD)
+        sent = 0
+        try:
+            for n, key in new:
+                msg, sender = build_forward(abvpop.retr(pop, n))
+                if sender.lower() in (own, fwd):
+                    # Не препращаме писма от самите нас (иначе може да стане кръг).
+                    log(f"Писмо {n}: от нас самите, пропускам.")
+                else:
+                    smtp.sendmail(USER, [FORWARD_TO], msg.as_bytes())
+                    sent += 1
+                    log(f"Писмо {n}: препратено.")
+                seen.add(key)
+        finally:
+            save_state({"init": True, "seen": sorted(seen & keys_now)})
+            smtp.quit()
+        log(f"Готово: препратени {sent} от {len(new)}.")
     finally:
-        save_state({"uidvalidity": validity, "last_uid": last})
-        smtp.quit()
-        imap.logout()
-    log(f"Готово: препратени {sent} от {len(new)}.")
+        pop.quit()
 
 
 if __name__ == "__main__":
