@@ -131,6 +131,10 @@ def main():
         # abv не позволява SMTP от сървърите на GitHub, затова по подразбиране
         # слагаме писмото направо в кутията в Gmail (IMAP). SMTP остава резервен вариант.
         use_gmail = bool(GMAIL_USER and GMAIL_PASSWORD)
+        if not use_gmail and os.environ.get("GITHUB_ACTIONS") == "true":
+            log(f"{len(new)} нови писма чакат: добави GMAIL_APP_PASSWORD в Secrets. "
+                "(abv не позволява изпращане от GitHub.)")
+            return
         if use_gmail:
             out = gmailbox.connect(GMAIL_USER, GMAIL_PASSWORD)
         else:
