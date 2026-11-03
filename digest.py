@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import envfile  # noqa: E402
 envfile.load()
 import abvpop  # noqa: E402
+import gmailbox  # noqa: E402
 
 TZ = ZoneInfo("Europe/Sofia")
 ABV_USER = os.environ["ABV_USER"]
@@ -188,11 +189,19 @@ def main():
     msg.set_content(plain)
     msg.add_alternative(f"<div style='max-width:720px'>{html_body}</div>", subtype="html")
 
-    smtp = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context())
-            if USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT))
-    smtp.login(ABV_USER, ABV_PASSWORD)
-    smtp.send_message(msg)
-    smtp.quit()
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["X-Forwarded-By"] = "abv-forwarder"  # да не влиза в следващия преглед
+    if GMAIL_USER and GMAIL_PASSWORD and DIGEST_TO.lower() == GMAIL_USER.lower():
+        # abv не позволява SMTP от GitHub: слагаме прегледа направо в кутията.
+        box = gmailbox.connect(GMAIL_USER, GMAIL_PASSWORD)
+        gmailbox.put(box, msg.as_bytes())
+        box.logout()
+    else:
+        smtp = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context())
+                if USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT))
+        smtp.login(ABV_USER, ABV_PASSWORD)
+        smtp.send_message(msg)
+        smtp.quit()
     print(f"Изпратен преглед: {len(items)} писма.")
 
 

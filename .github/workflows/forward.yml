@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Препрати новите писма
@@ -26,6 +26,8 @@ jobs:
           ABV_USER: ${{ secrets.ABV_USER }}
           ABV_PASSWORD: ${{ secrets.ABV_PASSWORD }}
           FORWARD_TO: ${{ secrets.FORWARD_TO }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python forward.py
       - name: Запиши докъде е стигнал
         if: always()

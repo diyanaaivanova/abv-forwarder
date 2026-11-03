@@ -21,12 +21,15 @@ from pathlib import Path
 import envfile  # noqa: E402
 envfile.load()
 import abvpop  # noqa: E402
+import gmailbox  # noqa: E402
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.abv.bg")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 USER = os.environ["ABV_USER"]
 PASSWORD = os.environ["ABV_PASSWORD"]
 FORWARD_TO = os.environ["FORWARD_TO"]
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "50"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 USE_SSL = os.environ.get("USE_SSL", "1") == "1"  # 0 само за локален тест
@@ -92,6 +95,13 @@ def build_forward(raw):
     return orig, addr
 
 
+def mark(raw):
+    """Оригиналното писмо + заглавка, че е минало през бота."""
+    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    msg["X-Forwarded-By"] = "abv-forwarder"
+    return msg
+
+
 def main():
     state = load_state()
     ctx = ssl.create_default_context()
@@ -118,24 +128,39 @@ def main():
 
         own = USER.lower()
         fwd = FORWARD_TO.lower()
-        smtp = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx)
-                if USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT))
-        smtp.login(USER, PASSWORD)
+        # abv не позволява SMTP от сървърите на GitHub, затова по подразбиране
+        # слагаме писмото направо в кутията в Gmail (IMAP). SMTP остава резервен вариант.
+        use_gmail = bool(GMAIL_USER and GMAIL_PASSWORD)
+        if use_gmail:
+            out = gmailbox.connect(GMAIL_USER, GMAIL_PASSWORD)
+        else:
+            out = (smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx)
+                   if USE_SSL else smtplib.SMTP(SMTP_HOST, SMTP_PORT))
+            out.login(USER, PASSWORD)
         sent = 0
         try:
             for n, key in new:
-                msg, sender = build_forward(abvpop.retr(pop, n))
+                raw = abvpop.retr(pop, n)
+                fwd_msg, sender = build_forward(raw)
                 if sender.lower() in (own, fwd):
                     # Не препращаме писма от самите нас (иначе може да стане кръг).
                     log(f"Писмо {n}: от нас самите, пропускам.")
+                elif use_gmail:
+                    orig = mark(raw)
+                    gmailbox.put(out, orig.as_bytes(), orig.get("Date"))
+                    sent += 1
+                    log(f"Писмо {n}: сложено в кутията.")
                 else:
-                    smtp.sendmail(USER, [FORWARD_TO], msg.as_bytes())
+                    out.sendmail(USER, [FORWARD_TO], fwd_msg.as_bytes())
                     sent += 1
                     log(f"Писмо {n}: препратено.")
                 seen.add(key)
         finally:
             save_state({"init": True, "seen": sorted(seen & keys_now)})
-            smtp.quit()
+            if use_gmail:
+                out.logout()
+            else:
+                out.quit()
         log(f"Готово: препратени {sent} от {len(new)}.")
     finally:
         pop.quit()
