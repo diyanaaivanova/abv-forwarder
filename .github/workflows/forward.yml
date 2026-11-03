@@ -1,0 +1,39 @@
+name: Препращане abv → office
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # на всеки 10 минути (GitHub може да закъснява)
+  workflow_dispatch: {}      # ръчно пускане от раздела Actions
+
+permissions:
+  contents: write            # за да запише state.json
+
+concurrency:
+  group: forward
+  cancel-in-progress: false
+
+jobs:
+  forward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Препрати новите писма
+        env:
+          ABV_USER: ${{ secrets.ABV_USER }}
+          ABV_PASSWORD: ${{ secrets.ABV_PASSWORD }}
+          FORWARD_TO: ${{ secrets.FORWARD_TO }}
+        run: python forward.py
+      - name: Запиши докъде е стигнал
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "abv-forwarder"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "state: $(date -u +%FT%TZ)"
+            git push
+          fi
