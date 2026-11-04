@@ -1,0 +1,40 @@
+name: Писмо за новия имейл до клиенти и превозвачи
+
+on:
+  schedule:
+    - cron: "41 7 * * 1-5"   # делнични дни ~09:41 зимно / ~10:41 лятно българско време
+  workflow_dispatch: {}      # ръчно пускане от раздела Actions
+
+permissions:
+  contents: write            # за да запише campaign_state.json
+
+concurrency:
+  group: campaign
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Изпрати днешната порция
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          CAMPAIGN_LIST: ${{ secrets.CAMPAIGN_LIST }}
+          CAMPAIGN_PER_DAY: ${{ vars.CAMPAIGN_PER_DAY }}
+        run: python campaign.py
+      - name: Запиши на кого е изпратено
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain campaign_state.json)" ]; then
+            git config user.name "abv-forwarder"
+            git config user.email "actions@users.noreply.github.com"
+            git add campaign_state.json
+            git commit -m "campaign: $(date -u +%FT%TZ)"
+            for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
+          fi
